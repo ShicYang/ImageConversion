@@ -13,6 +13,8 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { cn } from "@/lib/utils";
+import { defaultSettings, loadSettings, saveSettings, settingsSummary } from "@/lib/conversion-settings";
+import { createListenerScope } from "@/lib/listener-scope";
 import type {
   ConversionProgressEvent,
   ConversionSettings,
@@ -39,8 +41,9 @@ const FORMAT_OPTIONS: Array<{ value: OutputFormat; label: string }> = [
 ];
 const RESIZE_MODE_OPTIONS: Array<{ value: ResizeMode; label: string }> = [
   { value: "none", label: "不缩放" },
+  { value: "longest", label: "限制最长边" },
   { value: "fit", label: "等比适配" },
-  { value: "exact", label: "精确尺寸" },
+  { value: "exact", label: "拉伸至指定尺寸" },
 ];
 const ICO_SIZES = [16, 32, 48, 64, 128, 256] as const;
 
@@ -94,19 +97,10 @@ function isDesktopRuntime() {
 
 function App() {
   const isTauriRuntime = isDesktopRuntime();
-  const desktopWindow = isTauriRuntime ? getCurrentWindow() : null;
+  const desktopWindow = useMemo(() => isTauriRuntime ? getCurrentWindow() : null, [isTauriRuntime]);
 
-  const [settings, setSettings] = useState<ConversionSettings>({
-    targetFormat: "png",
-    quality: 90,
-    resize: {
-      mode: "none",
-      width: null,
-      height: null,
-      allowUpscale: false,
-    },
-    icoSize: 256,
-  });
+  const [settings, setSettings] = useState<ConversionSettings>(loadSettings);
+  const [settingsSaved, setSettingsSaved] = useState(true);
   const [viewState, setViewState] = useState<ConversionViewState>("idle");
   const [results, setResults] = useState<ConvertFileResult[]>([]);
   const [message, setMessage] = useState("拖入图片后会立即开始转换，输出到原文件同目录。");
@@ -125,6 +119,7 @@ function App() {
 
   useEffect(() => {
     settingsRef.current = settings;
+    setSettingsSaved(saveSettings(settings));
   }, [settings]);
 
   useEffect(() => {
@@ -132,7 +127,7 @@ function App() {
   }, [viewState]);
 
   const isProcessing = viewState === "processing";
-  const qualityEnabled = settings.targetFormat === "jpeg";
+  const qualityEnabled = settings.targetFormat === "jpeg" || (settings.targetFormat === "webp" && settings.webpMode === "lossy");
 
   const completedCount = useMemo(
     () => Math.min(progress.succeeded + progress.failed, progress.total),
@@ -221,19 +216,23 @@ function App() {
       return;
     }
 
-    let disposed = false;
+    const listeners = createListenerScope();
 
     const setupListeners = async () => {
-      setIsWindowMaximized(await desktopWindow.isMaximized());
-      const unlistenResize = await desktopWindow.onResized(async () => {
-        if (disposed) {
+      const maximized = await desktopWindow.isMaximized();
+      if (listeners.disposed) return;
+      setIsWindowMaximized(maximized);
+      await listeners.register(desktopWindow.onResized(async () => {
+        if (listeners.disposed) {
           return;
         }
 
-        setIsWindowMaximized(await desktopWindow.isMaximized());
-      });
-      const unlistenProgress = await listen<ConversionProgressEvent>("conversion://progress", ({ payload }) => {
-        if (disposed) {
+        const maximized = await desktopWindow.isMaximized();
+        if (!listeners.disposed) setIsWindowMaximized(maximized);
+      }));
+      if (listeners.disposed) return;
+      await listeners.register(listen<ConversionProgressEvent>("conversion://progress", ({ payload }) => {
+        if (listeners.disposed) {
           return;
         }
 
@@ -257,10 +256,11 @@ function App() {
         if (payload.status === "failed" && payload.message) {
           setMessage(payload.message);
         }
-      });
+      }));
 
-      const unlistenDrop = await desktopWindow.onDragDropEvent((event) => {
-        if (disposed) {
+      if (listeners.disposed) return;
+      await listeners.register(desktopWindow.onDragDropEvent((event) => {
+        if (listeners.disposed) {
           return;
         }
 
@@ -276,25 +276,20 @@ function App() {
           setViewState((current) => (current === "processing" ? current : "idle"));
           void startConversion(event.payload.paths, settingsRef.current);
         }
-      });
-
-      return () => {
-        unlistenProgress();
-        unlistenResize();
-        unlistenDrop();
-      };
+      }));
     };
 
-    let cleanup: (() => void) | undefined;
-    void setupListeners().then((fn) => {
-      cleanup = fn;
+    void setupListeners().catch(() => {
+      if (!listeners.disposed) {
+        setMessage("窗口事件初始化失败，请重新打开应用后重试。");
+      }
+      listeners.dispose();
     });
 
     return () => {
-      disposed = true;
-      cleanup?.();
+      listeners.dispose();
     };
-  }, [isTauriRuntime]);
+  }, [isTauriRuntime, desktopWindow]);
 
   const handleTargetFormatChange = (value: OutputFormat) => {
     setSettings((current) => ({
@@ -539,9 +534,9 @@ function App() {
               <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
                 <div className="space-y-2">
                   <CardTitle className="text-xl font-semibold text-slate-900">转换设置</CardTitle>
-                  <CardDescription className="text-sm text-slate-500">首版默认顺序处理，优先保证稳定和不覆盖原文件。</CardDescription>
+                  <CardDescription className="text-sm text-slate-500">先调整设置，再拖入或选择图片，即可按当前配置转换。</CardDescription>
                 </div>
-                <p className="text-sm text-slate-500">JPEG 支持质量调节，ICO 可选择输出尺寸。</p>
+                <Button variant="outline" disabled={isProcessing} onClick={() => setSettings(defaultSettings())}>恢复默认</Button>
               </div>
             </CardHeader>
             <CardContent className="space-y-5">
@@ -561,7 +556,34 @@ function App() {
                   </Select>
                 </Field>
 
-                <Field label={qualityEnabled ? "质量" : "质量（仅 JPEG）"}>
+                {settings.targetFormat === "png" && (
+                  <Field label="PNG 压缩档位">
+                    <Select value={settings.pngCompression} onValueChange={(value) => setSettings((current) => ({ ...current, pngCompression: value as ConversionSettings["pngCompression"] }))} disabled={isProcessing}>
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="fast">快速</SelectItem>
+                        <SelectItem value="balanced">均衡</SelectItem>
+                        <SelectItem value="best">更小体积</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-slate-500">均为无损压缩；更小体积通常需要更多处理时间，实际大小取决于图片。</p>
+                  </Field>
+                )}
+
+                {settings.targetFormat === "webp" && (
+                  <Field label="WebP 编码模式">
+                    <Select value={settings.webpMode} onValueChange={(value) => setSettings((current) => ({ ...current, webpMode: value as ConversionSettings["webpMode"] }))} disabled={isProcessing}>
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="lossless">无损 · 保留像素细节</SelectItem>
+                        <SelectItem value="lossy">有损 · 优先减小体积</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-slate-500">两种模式均支持透明背景；有损模式可调整画质。</p>
+                  </Field>
+                )}
+
+                {qualityEnabled && <Field label="画质">
                   <div className="space-y-3 rounded-2xl border border-slate-200/70 bg-white/70 px-4 py-3">
                     <Slider
                       min={1}
@@ -583,7 +605,23 @@ function App() {
                       <span className="text-slate-500">100</span>
                     </div>
                   </div>
-                </Field>
+                    <p className="text-xs text-slate-500">数值越高通常越清晰，文件也越大；100 仍为有损编码。</p>
+                </Field>}
+
+                {settings.targetFormat === "jpeg" && (
+                  <Field label="透明区域背景色">
+                    <div className="flex items-center gap-3">
+                      <input type="color" aria-label="JPEG 背景色" className="h-10 w-12 cursor-pointer rounded border border-slate-200 p-1" value={settings.jpegBackground} disabled={isProcessing} onChange={(event) => setSettings((current) => ({ ...current, jpegBackground: event.target.value }))} />
+                      <span className="text-sm text-slate-600">{settings.jpegBackground.toUpperCase()}</span>
+                      <Button variant="outline" disabled={isProcessing} onClick={() => setSettings((current) => ({ ...current, jpegBackground: "#ffffff" }))}>白色</Button>
+                    </div>
+                    <p className="text-xs text-slate-500">JPEG 不支持透明，透明和半透明区域将与此颜色合成。</p>
+                  </Field>
+                )}
+
+                {settings.targetFormat === "gif" && <p className="self-center text-sm text-amber-700">GIF 当前仅输出静态单帧图片。</p>}
+
+                {settings.targetFormat !== "ico" && <>
 
                 <Field label="缩放模式">
                   <Select
@@ -609,7 +647,18 @@ function App() {
                   </Select>
                 </Field>
 
-                <Field label="宽度">
+                {settings.resize.mode === "longest" && (
+                  <Field label="最长边（px）">
+                    <Input type="number" min="1" step="1" inputMode="numeric" placeholder="例如 1920" value={settings.resize.longestEdge ?? ""} disabled={isProcessing} onChange={(event) => {
+                      const longestEdge = toOptionalNumber(event.currentTarget.value);
+                      setSettings((current) => ({ ...current, resize: { ...current.resize, longestEdge } }));
+                    }} />
+                    <p className="text-xs text-slate-500">横图限制宽度，竖图限制高度，保持原比例。</p>
+                  </Field>
+                )}
+
+                {(settings.resize.mode === "fit" || settings.resize.mode === "exact") && <>
+                <Field label="宽度（px）">
                   <Input
                     type="number"
                     min="1"
@@ -630,7 +679,7 @@ function App() {
                   />
                 </Field>
 
-                <Field label="高度">
+                <Field label="高度（px）">
                   <Input
                     type="number"
                     min="1"
@@ -651,7 +700,10 @@ function App() {
                   />
                 </Field>
 
-                <Field label="ICO 尺寸">
+                </>}
+                </>}
+
+                {settings.targetFormat === "ico" && <Field label="ICO 尺寸">
                   <Select
                     value={String(settings.icoSize)}
                     onValueChange={(value) => {
@@ -671,9 +723,12 @@ function App() {
                       ))}
                     </SelectContent>
                   </Select>
-                </Field>
+                  <p className="text-xs text-slate-500">原图将等比缩放并居中，透明留白补齐正方形。</p>
+                </Field>}
               </div>
 
+              {settings.targetFormat !== "ico" && settings.resize.mode !== "none" && <>
+              <p className="text-xs text-slate-500">{settings.resize.mode === "exact" ? "拉伸可能改变原图比例；关闭放大时，宽高分别限制为不超过原图尺寸。" : settings.resize.mode === "fit" ? "宽高可只填一项；同时填写时，图片等比缩放至框内。" : "默认仅缩小图片，不放大较小的原图。"}</p>
               <label className="flex items-center gap-3 text-sm font-medium text-slate-700">
                 <Checkbox
                   checked={settings.resize.allowUpscale}
@@ -690,6 +745,11 @@ function App() {
                 />
                 <span>允许放大</span>
               </label>
+              </>}
+              <div className="space-y-2 rounded-2xl border border-slate-200/70 px-4 py-3">
+                <p className="text-sm font-medium text-slate-700">{settingsSummary(settings)}</p>
+                <p className="text-xs text-slate-500">输出到原文件目录，自动避开重名文件。{settingsSaved ? "已在此设备记住设置，下次打开继续使用。" : "设置暂未保存，当前仍可转换；请检查本地存储后重试。"}</p>
+              </div>
             </CardContent>
           </Card>
 
@@ -779,13 +839,30 @@ function normalizePaths(paths: string[]) {
 }
 
 function createRequest(paths: string[], settings: ConversionSettings): ConvertBatchRequest {
+  if (settings.targetFormat !== "ico") {
+    const { mode, width, height, longestEdge } = settings.resize;
+    if (mode === "longest" && longestEdge === null) throw new Error("请填写最长边尺寸。有效范围为 1–4294967295 的整数。");
+    if (mode === "fit" && width === null && height === null) throw new Error("等比适配需要至少填写宽度或高度。");
+    if (mode === "exact" && (width === null || height === null)) throw new Error("指定尺寸需要同时填写宽度和高度。");
+    const dimensions = mode === "longest" ? [longestEdge] : mode === "none" ? [] : [width, height];
+    if (dimensions.some((value) => value !== null && (!Number.isInteger(value) || value < 1 || value > 0xffffffff))) {
+      throw new Error("图片尺寸须为 1–4294967295 范围内的整数。");
+    }
+  }
   return {
     sources: paths,
     targetFormat: settings.targetFormat,
     outputDir: null,
-    quality: settings.targetFormat === "jpeg" ? settings.quality : settings.targetFormat === "webp" ? settings.quality : null,
-    resize: settings.resize,
+    quality: settings.targetFormat === "jpeg" || (settings.targetFormat === "webp" && settings.webpMode === "lossy") ? settings.quality : null,
+    resize: settings.targetFormat === "ico" || settings.resize.mode === "none"
+      ? { ...settings.resize, mode: "none", width: null, height: null, longestEdge: null }
+      : settings.resize.mode === "longest"
+        ? { ...settings.resize, width: null, height: null }
+        : { ...settings.resize, longestEdge: null },
     icoSize: settings.targetFormat === "ico" ? settings.icoSize : null,
+    pngCompression: settings.pngCompression,
+    webpMode: settings.webpMode,
+    jpegBackground: settings.jpegBackground,
   };
 }
 

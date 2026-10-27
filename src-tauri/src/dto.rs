@@ -18,6 +18,28 @@ pub enum ResizeMode {
     None,
     Fit,
     Exact,
+    Longest,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PngCompression {
+    Fast,
+    #[default]
+    Balanced,
+    Best,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebpMode {
+    #[default]
+    Lossless,
+    Lossy,
+}
+
+fn default_jpeg_background() -> String {
+    "#ffffff".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +49,8 @@ pub struct ResizeOptions {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub allow_upscale: bool,
+    #[serde(default)]
+    pub longest_edge: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +62,12 @@ pub struct ConvertBatchRequest {
     pub quality: Option<u8>,
     pub resize: ResizeOptions,
     pub ico_size: Option<u32>,
+    #[serde(default)]
+    pub png_compression: PngCompression,
+    #[serde(default)]
+    pub webp_mode: WebpMode,
+    #[serde(default = "default_jpeg_background")]
+    pub jpeg_background: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

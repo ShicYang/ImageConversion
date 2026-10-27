@@ -1,5 +1,7 @@
 export type OutputFormat = "png" | "jpeg" | "webp" | "bmp" | "gif" | "tiff" | "ico";
-export type ResizeMode = "none" | "fit" | "exact";
+export type ResizeMode = "none" | "fit" | "exact" | "longest";
+export type PngCompression = "fast" | "balanced" | "best";
+export type WebpMode = "lossless" | "lossy";
 export type ConvertFileStatus = "success" | "failed" | "skipped";
 export type ConversionViewState = "idle" | "dragging" | "processing" | "completed" | "error";
 
@@ -8,6 +10,7 @@ export interface ResizeOptions {
   width: number | null;
   height: number | null;
   allowUpscale: boolean;
+  longestEdge: number | null;
 }
 
 export interface ConvertBatchRequest {
@@ -17,6 +20,9 @@ export interface ConvertBatchRequest {
   quality: number | null;
   resize: ResizeOptions;
   icoSize: number | null;
+  pngCompression: PngCompression;
+  webpMode: WebpMode;
+  jpegBackground: string;
 }
 
 export interface ConvertFileResult {
@@ -54,4 +60,7 @@ export interface ConversionSettings {
   quality: number;
   resize: ResizeOptions;
   icoSize: number;
+  pngCompression: PngCompression;
+  webpMode: WebpMode;
+  jpegBackground: string;
 }
